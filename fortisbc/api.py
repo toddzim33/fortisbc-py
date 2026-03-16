@@ -16,7 +16,8 @@ Data flow (per account):
 """
 import logging
 import re
-from datetime import date
+from calendar import monthrange
+from datetime import date, datetime
 from typing import Optional
 
 from curl_cffi.requests import Session as CurlSession
@@ -33,7 +34,7 @@ PORTAL_ENTRY = "https://accounts.fortisbc.com/"
 ACCOUNT_SUMMARY_URL = f"{BASE_URL}/pages/account/account_summary.xhtml"
 ACCOUNT_DETAILS_URL = f"{BASE_URL}/pages/account/account_details.xhtml"
 CONSUMPTION_URL = f"{BASE_URL}/pages/account/consumtionHis.xhtml"
-CONSUMPTION_AJAX_URL = f"{CONSUMPTION_URL}?javax.portlet.faces.DirectLink=t"
+CONSUMPTION_AJAX_URL = f"{CONSUMPTION_URL}?javax.portlet.faces.DirectLink=true"
 
 
 class FortisbcClient:
@@ -186,8 +187,9 @@ class FortisbcClient:
             self._navigate_to_consumption(details_vs, is_electric=False)
             consumption_html = self._get_consumption_page()
             consumption_soup = BeautifulSoup(consumption_html, "html.parser")
+            consumption_vs = self._extract_view_state(consumption_soup)
 
-            return self._parse_gas_account(consumption_soup)
+            return self._parse_gas_account(consumption_soup, consumption_vs)
         except Exception:
             _LOGGER.exception("Failed to fetch gas account")
             return None
@@ -212,15 +214,26 @@ class FortisbcClient:
     # Internal: parsing
     # ------------------------------------------------------------------
 
-    def _parse_gas_account(self, soup: BeautifulSoup) -> Optional[GasAccount]:
-        """Parse gas consumption history page."""
-        # TODO: extract sa_id, account_id, customer_id from hidden fields
-        # and trigger the gas AJAX request
-        periods = self._parse_billing_table(soup, unit="GJ", has_temperature=True)
+    def _parse_gas_account(self, soup: BeautifulSoup, view_state: str) -> Optional[GasAccount]:
+        """Trigger gas AJAX and parse the monthly billing table."""
+        suffix = self._detect_consumption_suffix(soup)
+        if not suffix:
+            _LOGGER.warning("No consumption table found on gas page")
+            return None
+        trigger_id = self._find_ajax_trigger(soup, suffix)
+        if not trigger_id:
+            _LOGGER.warning("No AJAX trigger found for gas suffix %s", suffix)
+            return None
+        ajax_html = self._fetch_gas_ajax(suffix, view_state, trigger_id)
+        if ajax_html:
+            ajax_soup = BeautifulSoup(ajax_html, "html.parser")
+            periods = self._parse_gas_billing_table(ajax_soup)
+        else:
+            # Fall back to parsing whatever is already on the page
+            periods = self._parse_gas_billing_table(soup)
         if not periods:
             return None
-        # FIXME: sa_id, account_id, customer_id, premise_address require live debugging
-        # against the gas account_details page — HAR doesn't include those requests.
+        # FIXME: sa_id/account_id/customer_id/premise_address need live gas account debug
         return GasAccount(
             sa_id="",
             account_id="",
@@ -236,8 +249,7 @@ class FortisbcClient:
         view_state: str,
     ) -> Optional[ElectricAccount]:
         """Parse electric consumption history page via AJAX."""
-        # Determine suffix (11 or 21) from which trigger button is present
-        suffix = self._detect_electric_suffix(soup, link_id)
+        suffix = self._detect_consumption_suffix(soup)
         if not suffix:
             return None
 
@@ -328,13 +340,12 @@ class FortisbcClient:
             for el in soup.find_all("input", {"id": pattern})
         ]
 
-    def _detect_electric_suffix(self, soup: BeautifulSoup, link_id: str) -> Optional[str]:
-        """Determine which suffix (11, 21, etc.) corresponds to this account."""
-        # Look for trigger buttons — each service has a unique j_id button
-        for suffix in ["11", "21", "31"]:
-            table = soup.find("table", {"id": f"consumptionHistory:conspdt{suffix}"})
-            if table:
-                return suffix
+    def _detect_consumption_suffix(self, soup: BeautifulSoup) -> Optional[str]:
+        """Find the first consumptionHistory:conspdt{X} table and return its suffix."""
+        table = soup.find("table", id=re.compile(r"consumptionHistory:conspdt\w+"))
+        if table:
+            m = re.search(r":conspdt(\w+)$", table.get("id", ""))
+            return m.group(1) if m else None
         return None
 
     def _extract_electric_hidden_params(self, soup: BeautifulSoup, suffix: str) -> dict:
@@ -391,6 +402,62 @@ class FortisbcClient:
                         usage=usage,
                         usage_unit=unit,
                         avg_temperature=temp,
+                    ))
+                except (ValueError, IndexError):
+                    continue
+        return periods
+
+    def _fetch_gas_ajax(self, suffix: str, view_state: str, trigger_id: str) -> Optional[str]:
+        """POST the Ajax4JSF request for gas consumption data.
+
+        Gas uses selectDateRange3{S}/dateFrom2{S}/dateTo2{S} field names,
+        distinct from the electric selectDateRangeEle{S} fields.
+        """
+        data = {
+            "AJAXREQUEST": "_viewRoot",
+            "consumptionHistory": "consumptionHistory",
+            "consumptionHistory:DElRECVALl": "DEL",
+            f"consumptionHistory:selectDateRange3{suffix}": "-6",
+            f"consumptionHistory:dateFrom2{suffix}": "",
+            f"consumptionHistory:dateTo2{suffix}": "",
+            f"consumptionHistory:selectFileTypeGas2{suffix}": "1",
+            "javax.faces.ViewState": view_state,
+            f"param1{suffix}": "",
+            f"param2{suffix}": "",
+            f"param3{suffix}": "ABC",
+            trigger_id: trigger_id,
+        }
+        resp = self._session.post(CONSUMPTION_AJAX_URL, data=data)
+        if resp.status_code == 200 and resp.text:
+            return resp.text
+        return None
+
+    def _parse_gas_billing_table(self, soup: BeautifulSoup) -> list[BillingPeriod]:
+        """Parse gas monthly table: 'Month YYYY' + 'Billed GJs'.
+
+        HAR confirms the gas table has only 2 columns — no billing period dates.
+        Approximate start/end as first and last day of the named month.
+        """
+        periods = []
+        tables = soup.find_all("table", class_="table-bordered")
+        for table in tables:
+            rows = table.find("tbody").find_all("tr") if table.find("tbody") else []
+            for row in rows:
+                cells = [td.get_text(strip=True) for td in row.find_all("td")]
+                if len(cells) < 2:
+                    continue
+                try:
+                    dt = datetime.strptime(cells[0], "%B %Y")
+                    start = date(dt.year, dt.month, 1)
+                    last_day = monthrange(dt.year, dt.month)[1]
+                    end = date(dt.year, dt.month, last_day)
+                    usage = float(cells[1].replace(",", ""))
+                    periods.append(BillingPeriod(
+                        start_date=start,
+                        end_date=end,
+                        days=last_day,
+                        usage=usage,
+                        usage_unit="GJ",
                     ))
                 except (ValueError, IndexError):
                     continue
