@@ -1,18 +1,19 @@
 """FortisBC web portal scraper.
 
-Auth flow:
-  1. GET https://accounts.fortisbc.com/  → redirects to SiteMinder fbclogin.fcc
-  2. Scrape all form inputs (skip checkboxes), inject credentials into user/password fields
-  3. POST to same fbclogin.fcc URL → SiteMinder → SAML2 → HCL Axon redirect chain
-  4. Session lands on account_summary.xhtml — authenticated
+Auth flow (confirmed from HAR 2026-03-16):
+  1. POST login_standalone.fcc with User/Password/target/smagentname/Login — NO prior GET
+     smagentname is static (JS-rendered on www.fortisbc.com, confirmed from HAR)
+     Username is the FortisBC account username (NOT email address)
+  2. SiteMinder → 302 /protected → 302 www.fortisbc.com/ — session lands here
+  3. Lazy SAML: GET account_summary.xhtml → SAML2 → AOConsumerService → account_summary
 
 Data flow (per account):
-  5. GET  account_summary.xhtml     → extract ViewState + account link IDs
-  6. POST account_summary.xhtml     → select account (gas or electric)
-  7. GET  account_details.xhtml     → extract ViewState
-  8. POST account_details.xhtml     → navigate to consumption history
-  9. GET  consumtionHis.xhtml       → extract ViewState + hidden params + AJAX trigger IDs
-  10. POST consumtionHis.xhtml?javax.portlet.faces.DirectLink=t  → AJAX: billing period data
+  4. GET  account_summary.xhtml     → extract ViewState + account link IDs
+  5. POST account_summary.xhtml     → select account (gas or electric)
+  6. GET  account_details.xhtml     → extract ViewState
+  7. POST account_details.xhtml     → navigate to consumption history
+  8. GET  consumtionHis.xhtml       → extract ViewState + hidden params + AJAX trigger IDs
+  9. POST consumtionHis.xhtml?javax.portlet.faces.DirectLink=true → AJAX: billing period data
 """
 import logging
 import re
@@ -29,7 +30,9 @@ from .models import BillingPeriod, ElectricAccount, GasAccount
 _LOGGER = logging.getLogger(__name__)
 
 BASE_URL = "https://accounts.fortisbc.com/hcl-axon.com~iem~cssweb"
-PORTAL_ENTRY = "https://accounts.fortisbc.com/"
+LOGIN_URL = "https://ciam.fortisbc.com/siteminderagent/forms/login_standalone.fcc"
+LOGIN_TARGET = "https://ciam.fortisbc.com/protected"
+SMAGENTNAME = "agent_accessgateway_sovmprdcamagp01"  # static; JS-rendered on www.fortisbc.com
 
 ACCOUNT_SUMMARY_URL = f"{BASE_URL}/pages/account/account_summary.xhtml"
 ACCOUNT_DETAILS_URL = f"{BASE_URL}/pages/account/account_details.xhtml"
@@ -60,48 +63,36 @@ class FortisbcClient:
     def login(self) -> None:
         """Authenticate with FortisBC portal.
 
-        GET accounts.fortisbc.com → redirects to SiteMinder fbclogin.fcc.
-        Scrape all form fields (including session-specific smagentname token),
-        inject credentials, POST back to same URL.
+        Cold POST to login_standalone.fcc — no prior GET needed, no cookies required.
+        smagentname is static (JS-rendered on www.fortisbc.com; confirmed from HAR).
+        Username is the FortisBC account username, NOT an email address.
+
+        On success, session lands on www.fortisbc.com/ with SiteMinder cookies set.
+        The SAML handshake to accounts.fortisbc.com completes lazily when
+        _get_account_summary() makes its first GET.
         """
-        from urllib.parse import urljoin
-
-        # GET to obtain CIAM cookies + the login form with dynamic hidden fields
-        resp = self._session.get(PORTAL_ENTRY, allow_redirects=True)
-        login_url = resp.url
-        _LOGGER.debug("Login form URL: %s", login_url)
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        form = soup.find("form")
-        if not form:
-            raise FortisbcAuthError(f"No login form found at {login_url}")
-
-        # Collect all non-checkbox form fields (checkboxes only submit when checked)
-        form_data = {}
-        for inp in form.find_all("input"):
-            name = inp.get("name")
-            if name and inp.get("type", "").lower() != "checkbox":
-                form_data[name] = inp.get("value", "")
-
-        # Inject credentials — field names are lowercase on this form
-        form_data["user"] = self._username
-        form_data["password"] = self._password
-
-        post_url = form.get("action")
-        post_url = urljoin(login_url, post_url) if post_url else login_url
-
         resp = self._session.post(
-            post_url,
-            data=form_data,
-            headers={"Referer": login_url, "Origin": "https://ciam.fortisbc.com"},
+            LOGIN_URL,
+            data={
+                "User": self._username,
+                "Password": self._password,
+                "target": LOGIN_TARGET,
+                "smagentname": SMAGENTNAME,
+                "Login": "Log in",
+            },
+            headers={
+                "Origin": "https://www.fortisbc.com",
+                "Referer": "https://www.fortisbc.com/",
+            },
             allow_redirects=True,
         )
         _LOGGER.debug("Post-login URL: %s  status: %s", resp.url, resp.status_code)
 
-        # After SAML chain we should land on account_summary or consumption page
-        if "account_summary" not in resp.url and "consumtion" not in resp.url:
+        # Success: SiteMinder redirects to www.fortisbc.com/ after auth
+        # Failure: stays on ciam.fortisbc.com (login page re-displayed)
+        if "ciam.fortisbc.com" in resp.url:
             raise FortisbcAuthError(
-                f"Login failed or unexpected redirect: {resp.url}"
+                f"Login failed — still on CIAM after POST: {resp.url}"
             )
 
     def fetch_all(self) -> dict:

@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 from curl_cffi.requests import Session as CurlSession
 from fortisbc import FortisbcClient
 
-USERNAME = os.environ.get("FORTISBC_USERNAME", "miczimm@gmail.com")
+USERNAME = os.environ.get("FORTISBC_USERNAME", "miczimm")
 PASSWORD = os.environ.get("FORTISBC_PASSWORD")
 if not PASSWORD:
     print("Set env vars before running:")
