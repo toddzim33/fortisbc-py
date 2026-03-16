@@ -110,11 +110,40 @@ try:
     print(f"Gas link ID:      {gas_link}")
     print(f"Electric link IDs: {elec_links}")
 
-    # Dump all input names/ids to help debug if links not found
     if not gas_link and not elec_links:
+        # Dismiss "Link accounts now" dialog if present, then re-fetch
+        regn_form = soup.find("input", {"name": "regnLink1Form"})
+        if regn_form:
+            print("\n[DEBUG] Dismissing 'Link accounts' dialog...")
+            dismiss_btn = soup.find("input", {"value": "No, Thanks"})
+            btn_name = dismiss_btn.get("name") if dismiss_btn else "regnLink1Form:j_id133"
+            import requests as _req
+            resp2 = client._session.post(
+                "https://accounts.fortisbc.com/hcl-axon.com~iem~cssweb/pages/account/account_summary.xhtml",
+                data={
+                    "regnLink1Form": "regnLink1Form",
+                    "javax.faces.ViewState": vs,
+                    btn_name: "No, Thanks",
+                },
+                allow_redirects=True,
+            )
+            summary_html = resp2.text
+            soup = BeautifulSoup(summary_html, "html.parser")
+            vs = client._extract_view_state(soup)
+            gas_link = client._find_account_link(soup, "GAS")
+            elec_links = client._find_all_electric_links(soup)
+            print(f"After dismiss — Gas: {gas_link}  Electric: {elec_links}")
+
         print("\n[DEBUG] All inputs on account_summary page:")
         for inp in soup.find_all("input"):
             print(f"  id={inp.get('id')} name={inp.get('name')} type={inp.get('type')} value={str(inp.get('value',''))[:40]}")
+        print("\n[DEBUG] All <a> tags with 'acctSummary' in id/href:")
+        for a in soup.find_all("a"):
+            aid = a.get("id", "") or ""
+            href = a.get("href", "") or ""
+            onclick = a.get("onclick", "") or ""
+            if "acctSummary" in aid or "acctSummary" in href or "acctSummary" in onclick:
+                print(f"  id={aid!r} href={href[:60]!r} onclick={onclick[:80]!r}")
 
 except Exception as e:
     print(f"FAILED: {e}")

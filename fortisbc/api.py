@@ -152,7 +152,23 @@ class FortisbcClient:
     def _get_account_summary(self) -> str:
         resp = self._session.get(ACCOUNT_SUMMARY_URL, allow_redirects=True)
         resp = self._complete_saml_if_needed(resp)
-        return resp.text
+        html = resp.text
+        # Dismiss "Link accounts now" registration dialog if present
+        soup = BeautifulSoup(html, "html.parser")
+        if soup.find("input", {"name": "regnLink1Form"}):
+            vs = self._extract_view_state(soup)
+            _LOGGER.debug("Dismissing account-linking dialog")
+            resp = self._session.post(
+                ACCOUNT_SUMMARY_URL,
+                data={
+                    "regnLink1Form": "regnLink1Form",
+                    "javax.faces.ViewState": vs,
+                    "regnLink1Form:j_id133": "No, Thanks",
+                },
+                allow_redirects=True,
+            )
+            html = resp.text
+        return html
 
     def _select_account(self, link_id: str, view_state: str) -> str:
         """POST to account_summary to select an account. Returns account_details HTML."""
@@ -342,20 +358,18 @@ class FortisbcClient:
         return field["value"] if field else ""
 
     def _find_account_link(self, soup: BeautifulSoup, account_type: str) -> Optional[str]:
-        """Find the first account link ID for the given type (GAS or Electric)."""
-        # Links are inputs with IDs like account_summary:acctSummaryGASCmdLnkActNum1
-        pattern = re.compile(rf"acctSummary{account_type}CmdLnkActNum\d+", re.IGNORECASE)
-        el = soup.find("input", {"id": pattern})
-        if el:
-            return el.get("id", el.get("name", ""))
-        return None
+        """Find the first account link ID for the given type (GAS or Electric).
+
+        Account links are JSF commandLink <a> elements, not <input> elements.
+        IDs like: account_summary:acctSummaryGASCmdLnkActNum1
+        """
+        pattern = re.compile(rf"acctSummary{account_type}CmdLnkActNum\d+$", re.IGNORECASE)
+        el = soup.find("a", {"id": pattern})
+        return el.get("id", "") if el else None
 
     def _find_all_electric_links(self, soup: BeautifulSoup) -> list[str]:
-        pattern = re.compile(r"acctSummaryElectricCmdLnkActNum\d+", re.IGNORECASE)
-        return [
-            el.get("id", el.get("name", ""))
-            for el in soup.find_all("input", {"id": pattern})
-        ]
+        pattern = re.compile(r"acctSummaryElectricCmdLnkActNum\d+$", re.IGNORECASE)
+        return [el.get("id", "") for el in soup.find_all("a", {"id": pattern})]
 
     def _detect_consumption_suffix(self, soup: BeautifulSoup) -> Optional[str]:
         """Find the first consumptionHistory:conspdt{X} table and return its suffix."""
