@@ -390,17 +390,22 @@ class FortisbcClient:
         return result
 
     def _find_ajax_trigger(self, soup: BeautifulSoup, suffix: str) -> Optional[str]:
-        """Find the AJAX trigger button ID for this suffix."""
-        # Buttons are like consumptionHistory:j_id271, consumptionHistory:j_id332
-        # We need to find which one is associated with this suffix's section
-        # They appear after the table for this suffix
+        """Find the AJAX trigger button ID for this suffix.
+
+        HAR shows trigger is consumptionHistory:j_id<N> — search the whole page
+        since the button may appear before or after the data table in the DOM.
+        """
+        # Prefer submit input nearest to (after) the conspdt table for this suffix
         table = soup.find("table", {"id": f"consumptionHistory:conspdt{suffix}"})
-        if not table:
-            return None
-        # Find next submit input after this table
-        for el in table.find_all_next("input", {"type": "submit"}):
+        if table:
+            for el in table.find_all_next("input"):
+                el_id = el.get("id", "")
+                if el_id.startswith("consumptionHistory:j_id"):
+                    return el_id
+        # Fallback: any consumptionHistory:j_id input anywhere on the page
+        for el in soup.find_all("input"):
             el_id = el.get("id", "")
-            if el_id.startswith("consumptionHistory:"):
+            if el_id.startswith("consumptionHistory:j_id"):
                 return el_id
         return None
 
