@@ -149,6 +149,49 @@ except Exception as e:
     print(f"FAILED: {e}")
     import traceback; traceback.print_exc()
 
+print("\n--- Gas consumption page debug ---")
+try:
+    summary_html2 = client._get_account_summary()
+    soup2 = BeautifulSoup(summary_html2, "html.parser")
+    vs2 = client._extract_view_state(soup2)
+    gas_link2 = client._find_account_link(soup2, "GAS")
+    print(f"Gas link: {gas_link2}")
+    if gas_link2:
+        details_html = client._select_account(gas_link2, vs2)
+        details_soup = BeautifulSoup(details_html, "html.parser")
+        details_vs = client._extract_view_state(details_soup)
+        print(f"account_details ViewState: {details_vs}")
+        client._navigate_to_consumption(details_vs, is_electric=False)
+        cons_html = client._get_consumption_page()
+        cons_soup = BeautifulSoup(cons_html, "html.parser")
+        print(f"Consumption page: {len(cons_html)} bytes")
+        suffix = client._detect_consumption_suffix(cons_soup)
+        print(f"Detected suffix: {suffix}")
+        print("All consumptionHistory inputs (id + name + type):")
+        for el in cons_soup.find_all("input"):
+            eid = el.get("id", "")
+            ename = el.get("name", "")
+            if "consumptionHistory" in eid or "consumptionHistory" in ename:
+                print(f"  id={eid!r} name={ename!r} type={el.get('type')!r} value={str(el.get('value',''))[:30]!r}")
+        print("All <a> with consumptionHistory in id/onclick:")
+        for el in cons_soup.find_all("a"):
+            eid = el.get("id", "") or ""
+            onclick = el.get("onclick", "") or ""
+            if "consumptionHistory" in eid or "consumptionHistory" in onclick:
+                print(f"  id={eid!r} onclick={onclick[:80]!r}")
+        print("All <button> elements:")
+        for el in cons_soup.find_all("button"):
+            print(f"  id={el.get('id')!r} name={el.get('name')!r} type={el.get('type')!r} text={el.get_text(strip=True)[:40]!r}")
+        print("Any element with j_id in id:")
+        for el in cons_soup.find_all(id=re.compile(r"j_id")):
+            print(f"  tag={el.name} id={el.get('id')!r}")
+        with open("/tmp/consumption_page.html", "w") as f:
+            f.write(cons_html)
+        print("Saved to /tmp/consumption_page.html")
+except Exception as e:
+    print(f"Gas debug FAILED: {e}")
+    import traceback; traceback.print_exc()
+
 print("\n--- fetch_all() ---")
 try:
     result = client.fetch_all()

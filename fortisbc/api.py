@@ -260,10 +260,10 @@ class FortisbcClient:
         ajax_html = self._fetch_gas_ajax(suffix, view_state, trigger_id)
         if ajax_html:
             ajax_soup = BeautifulSoup(ajax_html, "html.parser")
-            periods = self._parse_gas_billing_table(ajax_soup)
+            periods = self._parse_monthly_table(ajax_soup, unit="GJ")
         else:
             # Fall back to parsing whatever is already on the page
-            periods = self._parse_gas_billing_table(soup)
+            periods = self._parse_monthly_table(soup, unit="GJ")
         if not periods:
             return None
         # FIXME: sa_id/account_id/customer_id/premise_address need live gas account debug
@@ -296,7 +296,7 @@ class FortisbcClient:
             return None
 
         ajax_soup = BeautifulSoup(ajax_html, "html.parser")
-        periods = self._parse_billing_table(ajax_soup, unit="kWh")
+        periods = self._parse_monthly_table(ajax_soup, unit="kWh")
         cdata = self._extract_cdata_json(ajax_html, suffix)
 
         return ElectricAccount(
@@ -390,23 +390,16 @@ class FortisbcClient:
         return result
 
     def _find_ajax_trigger(self, soup: BeautifulSoup, suffix: str) -> Optional[str]:
-        """Find the AJAX trigger button ID for this suffix.
+        """Find the AJAX trigger ID for this suffix.
 
-        HAR shows trigger is consumptionHistory:j_id<N> — search the whole page
-        since the button may appear before or after the data table in the DOM.
+        The trigger is a <script id="consumptionHistory:j_id<N>"> element whose
+        body contains an A4J.AJAX.Submit call referencing the suffix. The script's
+        id attribute is then included as a POST parameter to identify the action.
         """
-        # Prefer submit input nearest to (after) the conspdt table for this suffix
-        table = soup.find("table", {"id": f"consumptionHistory:conspdt{suffix}"})
-        if table:
-            for el in table.find_all_next("input"):
-                el_id = el.get("id", "")
-                if el_id.startswith("consumptionHistory:j_id"):
-                    return el_id
-        # Fallback: any consumptionHistory:j_id input anywhere on the page
-        for el in soup.find_all("input"):
-            el_id = el.get("id", "")
-            if el_id.startswith("consumptionHistory:j_id"):
-                return el_id
+        for el in soup.find_all("script", id=re.compile(r"^consumptionHistory:j_id")):
+            content = el.string or ""
+            if suffix in content and "A4J.AJAX.Submit" in content:
+                return el.get("id", "")
         return None
 
     def _parse_billing_table(
@@ -468,11 +461,11 @@ class FortisbcClient:
             return resp.text
         return None
 
-    def _parse_gas_billing_table(self, soup: BeautifulSoup) -> list[BillingPeriod]:
-        """Parse gas monthly table: 'Month YYYY' + 'Billed GJs'.
+    def _parse_monthly_table(self, soup: BeautifulSoup, unit: str) -> list[BillingPeriod]:
+        """Parse monthly usage table: 'Mon YYYY' + usage value.
 
-        HAR confirms the gas table has only 2 columns — no billing period dates.
-        Approximate start/end as first and last day of the named month.
+        Both gas (GJ) and electric (kWh) portals use this 2-column format.
+        Dates are approximate: first and last day of the named month.
         """
         periods = []
         tables = soup.find_all("table", class_="table-bordered")
@@ -483,7 +476,14 @@ class FortisbcClient:
                 if len(cells) < 2:
                     continue
                 try:
-                    dt = datetime.strptime(cells[0], "%B %Y")
+                    for fmt in ("%B %Y", "%b %Y"):
+                        try:
+                            dt = datetime.strptime(cells[0], fmt)
+                            break
+                        except ValueError:
+                            continue
+                    else:
+                        continue
                     start = date(dt.year, dt.month, 1)
                     last_day = monthrange(dt.year, dt.month)[1]
                     end = date(dt.year, dt.month, last_day)
@@ -493,7 +493,7 @@ class FortisbcClient:
                         end_date=end,
                         days=last_day,
                         usage=usage,
-                        usage_unit="GJ",
+                        usage_unit=unit,
                     ))
                 except (ValueError, IndexError):
                     continue
