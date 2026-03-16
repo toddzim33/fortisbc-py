@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "fortisbc"
+version = "0.1.0"
+description = "Python library for scraping FortisBC electricity and natural gas usage data"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+authors = [
+    {name = "toddzim33"}
+]
+keywords = ["fortisbc", "home-assistant", "energy", "utilities", "british-columbia"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Home Automation",
+]
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "responses",  # mock HTTP for tests
+]
+
+[project.urls]
+Homepage = "https://github.com/toddzim33/fortisbc-py"
+"Bug Tracker" = "https://github.com/toddzim33/fortisbc-py/issues"
+
+[tool.setuptools.packages.find]
+include = ["fortisbc*"]
