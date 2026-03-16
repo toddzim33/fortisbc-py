@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "fortisbc"
@@ -22,9 +22,8 @@ classifiers = [
     "Topic :: Home Automation",
 ]
 dependencies = [
-    "requests>=2.31",
+    "curl_cffi>=0.7",
     "beautifulsoup4>=4.12",
-    "lxml>=5.0",
 ]
 
 [project.optional-dependencies]
