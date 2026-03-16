@@ -110,9 +110,7 @@ class FortisbcClient:
             result["gas"] = self._fetch_gas_account(gas_link, view_state)
 
         for link_id in electric_links:
-            account = self._fetch_electric_account(link_id, view_state)
-            if account:
-                result["electric"].append(account)
+            result["electric"].extend(self._fetch_electric_account(link_id, view_state))
 
         return result
 
@@ -227,8 +225,8 @@ class FortisbcClient:
             _LOGGER.exception("Failed to fetch gas account")
             return None
 
-    def _fetch_electric_account(self, link_id: str, summary_view_state: str) -> Optional[ElectricAccount]:
-        """Full navigation flow for an electric account."""
+    def _fetch_electric_account(self, link_id: str, summary_view_state: str) -> list[ElectricAccount]:
+        """Full navigation flow for an electric account. Returns one ElectricAccount per SA."""
         try:
             details_html = self._select_account(link_id, summary_view_state)
             details_soup = BeautifulSoup(details_html, "html.parser")
@@ -237,11 +235,24 @@ class FortisbcClient:
             self._navigate_to_consumption(details_vs, is_electric=True)
             consumption_html = self._get_consumption_page()
             consumption_soup = BeautifulSoup(consumption_html, "html.parser")
+            consumption_vs = self._extract_view_state(consumption_soup)
 
-            return self._parse_electric_account(consumption_soup, link_id, details_vs)
+            suffix = self._detect_consumption_suffix(consumption_soup)
+            if not suffix:
+                return []
+            hidden = self._extract_electric_hidden_params(consumption_soup, suffix)
+            trigger_id = self._find_ajax_trigger(consumption_soup, suffix)
+            if not trigger_id:
+                return []
+
+            ajax_html = self._fetch_electric_ajax(consumption_soup, suffix, hidden, trigger_id, consumption_vs)
+            if not ajax_html:
+                return []
+
+            return self._parse_cdata_billing(ajax_html)
         except Exception:
             _LOGGER.exception("Failed to fetch electric account %s", link_id)
-            return None
+            return []
 
     # ------------------------------------------------------------------
     # Internal: parsing
@@ -275,41 +286,94 @@ class FortisbcClient:
             billing_periods=periods,
         )
 
-    def _parse_electric_account(
-        self,
-        soup: BeautifulSoup,
-        link_id: str,
-        view_state: str,
-    ) -> Optional[ElectricAccount]:
-        """Parse electric consumption history page via AJAX."""
-        suffix = self._detect_consumption_suffix(soup)
-        if not suffix:
-            return None
+    def _parse_cdata_billing(self, ajax_html: str) -> list[ElectricAccount]:
+        """Parse the _ajax:data CDATA blob into ElectricAccount objects, one per SA.
 
-        hidden = self._extract_electric_hidden_params(soup, suffix)
-        trigger_id = self._find_ajax_trigger(soup, suffix)
-        if not trigger_id:
-            return None
-
-        ajax_html = self._fetch_electric_ajax(soup, suffix, hidden, trigger_id, view_state)
-        if not ajax_html:
-            return None
-
-        ajax_soup = BeautifulSoup(ajax_html, "html.parser")
-        periods = self._parse_monthly_table(ajax_soup, unit="kWh")
-        cdata = self._extract_cdata_json(ajax_html, suffix)
-
-        return ElectricAccount(
-            sa_id=hidden.get("c", ""),
-            account_id=hidden.get("e", ""),
-            customer_id=hidden.get("d", ""),
-            meter_id=cdata.get("meterId", ""),
-            service_point_id=cdata.get("servicePointId", ""),
-            premise_address=cdata.get("premiseAddr", ""),
-            rate_id=cdata.get("rateId", ""),
-            hourly_available=cdata.get("hourlyDataAvailable", False),
-            billing_periods=periods,
+        The CDATA contains consDetListCurrGraph — one entry per billing segment with
+        real start/end dates (DD/MM/YYYY), cost (totAmntDue), and full account metadata.
+        Segments are grouped by saId so each SA becomes its own ElectricAccount.
+        """
+        m = re.search(
+            r'<span id="_ajax:data"><!\[CDATA\[(.*?)\]\]></span>', ajax_html, re.DOTALL
         )
+        if not m:
+            _LOGGER.warning("No _ajax:data CDATA found in electric AJAX response")
+            return []
+        blob = m.group(1)
+
+        # Each entry in consDetListCurrGraph has an electricConsRetDTO with billing details.
+        # Fields appear in consistent order; use DOTALL to match across whitespace.
+        entry_pattern = re.compile(
+            r"'electricConsRetDTO':\{"
+            r"'accountId':'(?P<accountId>[^']+)'.*?"
+            r"'custId':'(?P<custId>[^']+)'.*?"
+            r"(?:'meterId':'(?P<meterId>[^']+)'.*?)?"
+            r"'premiseAddr':'(?P<premiseAddr>[^']+)'.*?"
+            r"'rateId':'(?P<rateId>[^']+)'.*?"
+            r"'saId':'(?P<saId>[^']+)'.*?"
+            r"(?:'servicePointId':'(?P<servicePointId>[^']+)'.*?)?"
+            r"'segEndDt':'(?P<segEndDt>[^']+)'.*?"
+            r"'segStartDt':'(?P<segStartDt>[^']+)'.*?"
+            r"'totAmntDue':'(?P<totAmntDue>[^']+)'.*?"
+            r"'usageQuantNumber':'(?P<usage>[^']+)'",
+            re.DOTALL,
+        )
+        # Also grab hourlyDataAvailable from intDatConsDTO
+        hourly_pattern = re.compile(r"'hourlyDataAvailable':(true|false)")
+        hourly_flags = hourly_pattern.findall(blob)
+
+        sa_periods: dict[str, list[BillingPeriod]] = {}
+        sa_meta: dict[str, dict] = {}
+
+        for i, match in enumerate(entry_pattern.finditer(blob)):
+            d = match.groupdict()
+            sa_id = d["saId"]
+            try:
+                start = _parse_date(d["segStartDt"])
+                end = _parse_date(d["segEndDt"])
+                usage = float(d["usage"].replace(",", ""))
+                cost = float(d["totAmntDue"])
+                days = (end - start).days
+            except (ValueError, KeyError):
+                continue
+
+            if sa_id not in sa_meta:
+                sa_meta[sa_id] = {
+                    "account_id": d.get("accountId", ""),
+                    "customer_id": d.get("custId", ""),
+                    "premise_address": d.get("premiseAddr", ""),
+                    "rate_id": d.get("rateId", ""),
+                    "meter_id": d.get("meterId") or "",
+                    "service_point_id": d.get("servicePointId") or "",
+                    "hourly_available": (hourly_flags[i] == "true") if i < len(hourly_flags) else False,
+                }
+                sa_periods[sa_id] = []
+
+            sa_periods[sa_id].append(BillingPeriod(
+                start_date=start,
+                end_date=end,
+                days=days,
+                usage=usage,
+                usage_unit="kWh",
+                cost=cost,
+            ))
+
+        accounts = []
+        for sa_id, periods in sa_periods.items():
+            periods.sort(key=lambda p: p.start_date, reverse=True)
+            meta = sa_meta[sa_id]
+            accounts.append(ElectricAccount(
+                sa_id=sa_id,
+                account_id=meta["account_id"],
+                customer_id=meta["customer_id"],
+                meter_id=meta["meter_id"],
+                service_point_id=meta["service_point_id"],
+                premise_address=meta["premise_address"],
+                rate_id=meta["rate_id"],
+                hourly_available=meta["hourly_available"],
+                billing_periods=periods,
+            ))
+        return accounts
 
     def _fetch_electric_ajax(
         self,
@@ -499,28 +563,6 @@ class FortisbcClient:
                     continue
         return periods
 
-    def _extract_cdata_json(self, xml_text: str, suffix: str) -> dict:
-        """Extract key fields from the JSON-like CDATA blob in the AJAX response."""
-        result = {}
-        # The CDATA contains JS object literal (not valid JSON, uses single quotes)
-        # Extract specific fields via regex
-        patterns = {
-            "meterId": rf"'meterId':'(\d+)'",
-            "servicePointId": rf"'servicePointId':'(\d+)'",
-            "premiseAddr": rf"'premiseAddr':'([^']+)'",
-            "rateId": rf"'rateId':'(\w+)'",
-            "hourlyDataAvailable": rf"'hourlyDataAvailable':(true|false)",
-        }
-        for key, pattern in patterns.items():
-            m = re.search(pattern, xml_text)
-            if m:
-                val = m.group(1)
-                if val == "true":
-                    val = True
-                elif val == "false":
-                    val = False
-                result[key] = val
-        return result
 
 
 def _parse_date(s: str) -> date:

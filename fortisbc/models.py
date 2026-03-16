@@ -13,6 +13,7 @@ class BillingPeriod:
     usage: float          # kWh for electric, GJ for gas
     usage_unit: str       # "kWh" or "GJ"
     avg_temperature: Optional[float] = None  # gas only
+    cost: Optional[float] = None             # CAD, from totAmntDue (electric only for now)
 
 
 @dataclass
