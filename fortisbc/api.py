@@ -1,9 +1,9 @@
 """FortisBC web portal scraper.
 
 Auth flow:
-  1. GET https://www.fortisbc.com/accounts  → extract smagentname hidden field
-  2. POST https://ciam.fortisbc.com/siteminderagent/forms/login_standalone.fcc
-  3. Follow SiteMinder → SAML2 → HCL Axon redirect chain (requests handles automatically)
+  1. GET https://accounts.fortisbc.com/  → follows redirects to SiteMinder fbclogin.fcc
+  2. Scrape all form fields (skip unchecked checkboxes), inject credentials
+  3. POST to form action with Referer/Origin headers → SiteMinder → SAML2 → HCL Axon
   4. Session is now authenticated at accounts.fortisbc.com
 
 Data flow (per account):
@@ -19,9 +19,10 @@ import re
 from datetime import date
 from typing import Optional
 
-import requests
+from curl_cffi.requests import Session as CurlSession
 from bs4 import BeautifulSoup
 
+from .exceptions import FortisbcAuthError, FortisbcError
 from .models import BillingPeriod, ElectricAccount, GasAccount
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,22 +30,13 @@ _LOGGER = logging.getLogger(__name__)
 BASE_URL = "https://accounts.fortisbc.com/hcl-axon.com~iem~cssweb"
 LOGIN_URL = "https://ciam.fortisbc.com/siteminderagent/forms/login_standalone.fcc"
 PORTAL_LOGIN_PAGE = "https://www.fortisbc.com/accounts"
+LOGIN_TARGET = "https://ciam.fortisbc.com/protected"
+SMAGENTNAME = "agent_accessgateway_sovmprdcamagp01"  # confirmed from HAR, JS-rendered so not scrapeable
 
 ACCOUNT_SUMMARY_URL = f"{BASE_URL}/pages/account/account_summary.xhtml"
 ACCOUNT_DETAILS_URL = f"{BASE_URL}/pages/account/account_details.xhtml"
 CONSUMPTION_URL = f"{BASE_URL}/pages/account/consumtionHis.xhtml"
 CONSUMPTION_AJAX_URL = f"{CONSUMPTION_URL}?javax.portlet.faces.DirectLink=t"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-}
-
-
-class FortisbcAuthError(Exception):
-    """Raised when login fails."""
 
 
 class FortisbcClient:
@@ -59,33 +51,44 @@ class FortisbcClient:
     def __init__(self, username: str, password: str) -> None:
         self._username = username
         self._password = password
-        self._session = requests.Session()
-        self._session.headers.update(HEADERS)
+        # impersonate="chrome110" gives us a real Chrome TLS fingerprint —
+        # SiteMinder rejects Python's default SSL ClientHello as a bot
+        self._session = CurlSession(impersonate="chrome110")
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def login(self) -> None:
-        """Authenticate with FortisBC portal."""
-        smagentname = self._get_smagentname()
+        """Authenticate with FortisBC portal.
+
+        Per HAR analysis: browser POSTs cold to login_standalone.fcc with no
+        prior GET (no cookies in the request). smagentname is hardcoded because
+        www.fortisbc.com/accounts renders the form via JS (not static HTML).
+        Any prior GET to CIAM sets cookies that interfere with this endpoint.
+        """
         resp = self._session.post(
             LOGIN_URL,
             data={
                 "User": self._username,
                 "Password": self._password,
-                "target": "https://ciam.fortisbc.com/protected",
-                "smagentname": smagentname,
+                "target": LOGIN_TARGET,
+                "smagentname": SMAGENTNAME,
                 "Login": "Log in",
+            },
+            headers={
+                "Origin": "https://www.fortisbc.com",
+                "Referer": PORTAL_LOGIN_PAGE,
             },
             allow_redirects=True,
         )
+        _LOGGER.debug("Post-login URL: %s  status: %s", resp.url, resp.status_code)
+
         # After SAML chain we should land on account_summary
         if "account_summary" not in resp.url and "consumtion" not in resp.url:
             raise FortisbcAuthError(
                 f"Login failed or unexpected redirect: {resp.url}"
             )
-        _LOGGER.debug("Logged in, landed at: %s", resp.url)
 
     def fetch_all(self) -> dict:
         """Fetch data for all accounts. Returns dict with 'gas' and 'electric' keys."""
@@ -111,16 +114,6 @@ class FortisbcClient:
     # ------------------------------------------------------------------
     # Internal: auth
     # ------------------------------------------------------------------
-
-    def _get_smagentname(self) -> str:
-        """Scrape smagentname from the login page form."""
-        resp = self._session.get(PORTAL_LOGIN_PAGE, allow_redirects=True)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        field = soup.find("input", {"name": "smagentname"})
-        if field:
-            return field.get("value", "agent_accessgateway_sovmprdcamagp01")
-        # Fallback to known value
-        return "agent_accessgateway_sovmprdcamagp01"
 
     # ------------------------------------------------------------------
     # Internal: navigation
@@ -213,6 +206,8 @@ class FortisbcClient:
         periods = self._parse_billing_table(soup, unit="GJ", has_temperature=True)
         if not periods:
             return None
+        # FIXME: sa_id, account_id, customer_id, premise_address require live debugging
+        # against the gas account_details page — HAR doesn't include those requests.
         return GasAccount(
             sa_id="",
             account_id="",

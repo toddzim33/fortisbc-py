@@ -12,7 +12,6 @@ class BillingPeriod:
     days: int
     usage: float          # kWh for electric, GJ for gas
     usage_unit: str       # "kWh" or "GJ"
-    amount_due: Optional[float] = None   # dollars
     avg_temperature: Optional[float] = None  # gas only
 
 
