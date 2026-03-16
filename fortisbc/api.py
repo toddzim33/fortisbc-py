@@ -120,12 +120,38 @@ class FortisbcClient:
     # Internal: auth
     # ------------------------------------------------------------------
 
+    def _complete_saml_if_needed(self, resp) -> "requests.Response":
+        """If the response is a SAML assertion page, POST it to complete the handshake.
+
+        The SAML intermediate page is a 200 OK with a JS auto-submit form containing
+        SAMLResponse + RelayState. Browsers execute the JS; we must POST manually.
+        """
+        from urllib.parse import urljoin
+        soup = BeautifulSoup(resp.text, "html.parser")
+        saml_input = soup.find("input", {"name": "SAMLResponse"})
+        if not saml_input:
+            return resp
+        form = soup.find("form")
+        action = form.get("action") if form else None
+        if not action:
+            _LOGGER.warning("SAML page found but no form action; cannot complete handshake")
+            return resp
+        action = urljoin(resp.url, action)
+        form_data = {
+            inp["name"]: inp.get("value", "")
+            for inp in soup.find_all("input")
+            if inp.get("name")
+        }
+        _LOGGER.debug("Completing SAML handshake → %s", action)
+        return self._session.post(action, data=form_data, allow_redirects=True)
+
     # ------------------------------------------------------------------
     # Internal: navigation
     # ------------------------------------------------------------------
 
     def _get_account_summary(self) -> str:
         resp = self._session.get(ACCOUNT_SUMMARY_URL, allow_redirects=True)
+        resp = self._complete_saml_if_needed(resp)
         return resp.text
 
     def _select_account(self, link_id: str, view_state: str) -> str:
