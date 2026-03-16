@@ -1,10 +1,10 @@
 """FortisBC web portal scraper.
 
 Auth flow:
-  1. GET https://accounts.fortisbc.com/  → follows redirects to SiteMinder fbclogin.fcc
-  2. Scrape all form fields (skip unchecked checkboxes), inject credentials
-  3. POST to form action with Referer/Origin headers → SiteMinder → SAML2 → HCL Axon
-  4. Session is now authenticated at accounts.fortisbc.com
+  1. GET https://accounts.fortisbc.com/  → redirects to SiteMinder fbclogin.fcc
+  2. Scrape all form inputs (skip checkboxes), inject credentials into user/password fields
+  3. POST to same fbclogin.fcc URL → SiteMinder → SAML2 → HCL Axon redirect chain
+  4. Session lands on account_summary.xhtml — authenticated
 
 Data flow (per account):
   5. GET  account_summary.xhtml     → extract ViewState + account link IDs
@@ -28,10 +28,7 @@ from .models import BillingPeriod, ElectricAccount, GasAccount
 _LOGGER = logging.getLogger(__name__)
 
 BASE_URL = "https://accounts.fortisbc.com/hcl-axon.com~iem~cssweb"
-LOGIN_URL = "https://ciam.fortisbc.com/siteminderagent/forms/login_standalone.fcc"
-PORTAL_LOGIN_PAGE = "https://www.fortisbc.com/accounts"
-LOGIN_TARGET = "https://ciam.fortisbc.com/protected"
-SMAGENTNAME = "agent_accessgateway_sovmprdcamagp01"  # confirmed from HAR, JS-rendered so not scrapeable
+PORTAL_ENTRY = "https://accounts.fortisbc.com/"
 
 ACCOUNT_SUMMARY_URL = f"{BASE_URL}/pages/account/account_summary.xhtml"
 ACCOUNT_DETAILS_URL = f"{BASE_URL}/pages/account/account_details.xhtml"
@@ -62,29 +59,45 @@ class FortisbcClient:
     def login(self) -> None:
         """Authenticate with FortisBC portal.
 
-        Per HAR analysis: browser POSTs cold to login_standalone.fcc with no
-        prior GET (no cookies in the request). smagentname is hardcoded because
-        www.fortisbc.com/accounts renders the form via JS (not static HTML).
-        Any prior GET to CIAM sets cookies that interfere with this endpoint.
+        GET accounts.fortisbc.com → redirects to SiteMinder fbclogin.fcc.
+        Scrape all form fields (including session-specific smagentname token),
+        inject credentials, POST back to same URL.
         """
+        from urllib.parse import urljoin
+
+        # GET to obtain CIAM cookies + the login form with dynamic hidden fields
+        resp = self._session.get(PORTAL_ENTRY, allow_redirects=True)
+        login_url = resp.url
+        _LOGGER.debug("Login form URL: %s", login_url)
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        form = soup.find("form")
+        if not form:
+            raise FortisbcAuthError(f"No login form found at {login_url}")
+
+        # Collect all non-checkbox form fields (checkboxes only submit when checked)
+        form_data = {}
+        for inp in form.find_all("input"):
+            name = inp.get("name")
+            if name and inp.get("type", "").lower() != "checkbox":
+                form_data[name] = inp.get("value", "")
+
+        # Inject credentials — field names are lowercase on this form
+        form_data["user"] = self._username
+        form_data["password"] = self._password
+
+        post_url = form.get("action")
+        post_url = urljoin(login_url, post_url) if post_url else login_url
+
         resp = self._session.post(
-            LOGIN_URL,
-            data={
-                "User": self._username,
-                "Password": self._password,
-                "target": LOGIN_TARGET,
-                "smagentname": SMAGENTNAME,
-                "Login": "Log in",
-            },
-            headers={
-                "Origin": "https://www.fortisbc.com",
-                "Referer": PORTAL_LOGIN_PAGE,
-            },
+            post_url,
+            data=form_data,
+            headers={"Referer": login_url, "Origin": "https://ciam.fortisbc.com"},
             allow_redirects=True,
         )
         _LOGGER.debug("Post-login URL: %s  status: %s", resp.url, resp.status_code)
 
-        # After SAML chain we should land on account_summary
+        # After SAML chain we should land on account_summary or consumption page
         if "account_summary" not in resp.url and "consumtion" not in resp.url:
             raise FortisbcAuthError(
                 f"Login failed or unexpected redirect: {resp.url}"
