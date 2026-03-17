@@ -14,6 +14,8 @@ Data flow (per account):
   7. POST account_details.xhtml     → navigate to consumption history
   8. GET  consumtionHis.xhtml       → extract ViewState + hidden params + AJAX trigger IDs
   9. POST consumtionHis.xhtml?javax.portlet.faces.DirectLink=true → AJAX: billing period data
+
+Note: "consumtion" is FortisBC's own typo in the URL — preserved faithfully.
 """
 import logging
 import re
@@ -44,9 +46,12 @@ class FortisbcClient:
     """Scrapes FortisBC MyAccount portal for usage data.
 
     Usage:
-        client = FortisbcClient("user@example.com", "password")
-        await client.login()
-        accounts = await client.fetch_all()
+        client = FortisbcClient("username", "password")
+        try:
+            client.login()
+            data = client.fetch_all()
+        finally:
+            client.close()
     """
 
     def __init__(self, username: str, password: str) -> None:
@@ -55,6 +60,10 @@ class FortisbcClient:
         # impersonate="chrome110" gives us a real Chrome TLS fingerprint —
         # SiteMinder rejects Python's default SSL ClientHello as a bot
         self._session = CurlSession(impersonate="chrome110")
+
+    def close(self) -> None:
+        """Close the underlying TLS session and release resources."""
+        self._session.close()
 
     # ------------------------------------------------------------------
     # Public API
@@ -419,7 +428,9 @@ class FortisbcClient:
 
     def _extract_view_state(self, soup: BeautifulSoup) -> str:
         field = soup.find("input", {"name": "javax.faces.ViewState"})
-        return field["value"] if field else ""
+        if not field or not field.get("value"):
+            raise FortisbcError("ViewState missing from page — session may have expired or navigation failed")
+        return str(field["value"])
 
     def _find_account_link(self, soup: BeautifulSoup, account_type: str) -> Optional[str]:
         """Find the first account link ID for the given type (GAS or Electric).
@@ -465,40 +476,6 @@ class FortisbcClient:
             if suffix in content and "A4J.AJAX.Submit" in content:
                 return el.get("id", "")
         return None
-
-    def _parse_billing_table(
-        self,
-        soup: BeautifulSoup,
-        unit: str,
-        has_temperature: bool = False,
-    ) -> list[BillingPeriod]:
-        """Parse billing period table from page or AJAX response HTML."""
-        periods = []
-        # Tables have class "table table-bordered"
-        tables = soup.find_all("table", class_="table-bordered")
-        for table in tables:
-            rows = table.find("tbody").find_all("tr") if table.find("tbody") else []
-            for row in rows:
-                cells = [td.get_text(strip=True) for td in row.find_all("td")]
-                if len(cells) < 4:
-                    continue
-                try:
-                    start = _parse_date(cells[0])
-                    end = _parse_date(cells[1])
-                    days = int(cells[2])
-                    usage = float(cells[3].replace(",", ""))
-                    temp = float(cells[4]) if has_temperature and len(cells) > 4 else None
-                    periods.append(BillingPeriod(
-                        start_date=start,
-                        end_date=end,
-                        days=days,
-                        usage=usage,
-                        usage_unit=unit,
-                        avg_temperature=temp,
-                    ))
-                except (ValueError, IndexError):
-                    continue
-        return periods
 
     def _fetch_gas_ajax(self, suffix: str, view_state: str, trigger_id: str) -> Optional[str]:
         """POST the Ajax4JSF request for gas consumption data.
