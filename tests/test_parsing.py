@@ -8,7 +8,7 @@ from datetime import date
 import pytest
 from bs4 import BeautifulSoup
 
-from fortisbc.api import FortisbcClient
+from fortisbc.api import FortisbcClient, _parse_date
 from fortisbc.models import BillingPeriod, ElectricAccount, GasAccount
 
 
@@ -238,6 +238,106 @@ class TestSamlDetection:
     def test_non_saml_page_passes_through(self):
         soup = BeautifulSoup(self.NON_SAML_PAGE, "html.parser")
         assert soup.find("input", {"name": "SAMLResponse"}) is None
+
+
+# ---------------------------------------------------------------------------
+# Billing history parsing
+# ---------------------------------------------------------------------------
+
+class TestParseBillingHistory:
+
+    def test_returns_five_bill_rows(self, gas_billing_history_soup):
+        """Fixture has 5 Bill entries; Payments and Late charges are skipped."""
+        client = _client()
+        results = client._parse_billing_history(gas_billing_history_soup)
+        assert len(results) == 5
+
+    def test_most_recent_bill_amount(self, gas_billing_history_soup):
+        """Jan 14 – Feb 11, 2026 bill: $157.54."""
+        client = _client()
+        results = client._parse_billing_history(gas_billing_history_soup)
+        start, end, amount = results[0]
+        assert amount == pytest.approx(157.54)
+
+    def test_most_recent_bill_dates(self, gas_billing_history_soup):
+        """Jan 14 – Feb 11, 2026: start and end dates extracted correctly."""
+        client = _client()
+        results = client._parse_billing_history(gas_billing_history_soup)
+        start, end, _ = results[0]
+        assert start == date(2026, 1, 14)
+        assert end == date(2026, 2, 11)
+
+    def test_year_boundary_bill_dates(self, gas_billing_history_soup):
+        """Dec 12 – Jan 13, 2026: start year is 2025 (start month > end month)."""
+        client = _client()
+        results = client._parse_billing_history(gas_billing_history_soup)
+        start, end, amount = results[1]
+        assert start == date(2025, 12, 12)
+        assert end == date(2026, 1, 13)
+        assert amount == pytest.approx(153.43)
+
+    def test_payment_rows_excluded(self, gas_billing_history_soup):
+        """Payments (e.g. Feb 16, 2026 for -$157.54) must not appear in results."""
+        client = _client()
+        results = client._parse_billing_history(gas_billing_history_soup)
+        # All amounts should be positive (bills only)
+        assert all(amount > 0 for _, _, amount in results)
+
+    def test_late_charges_excluded(self, gas_billing_history_soup):
+        """Late payment charges (Dec 11, 2025) should not appear in results."""
+        client = _client()
+        results = client._parse_billing_history(gas_billing_history_soup)
+        # No single-date rows (they'd have no '-' date range)
+        assert len(results) == 5  # only the 5 Bill rows
+
+    def test_empty_on_missing_table(self):
+        """Returns empty list if no table found."""
+        from bs4 import BeautifulSoup
+        client = _client()
+        soup = BeautifulSoup("<html><body></body></html>", "html.parser")
+        assert client._parse_billing_history(soup) == []
+
+
+class TestApplyGasBillingCosts:
+
+    def test_cost_applied_by_start_month(self):
+        """Jan 14 billing period matches Jan 2026 consumption month."""
+        client = _client()
+        periods = [
+            BillingPeriod(date(2026, 1, 1), date(2026, 1, 31), 31, 10.3, "GJ"),
+            BillingPeriod(date(2025, 12, 1), date(2025, 12, 31), 31, 10.6, "GJ"),
+        ]
+        billing_costs = [
+            (date(2026, 1, 14), date(2026, 2, 11), 157.54),
+            (date(2025, 12, 12), date(2026, 1, 13), 153.43),
+        ]
+        result = client._apply_gas_billing_costs(periods, billing_costs)
+        assert result[0].cost == pytest.approx(157.54)
+        assert result[1].cost == pytest.approx(153.43)
+
+    def test_unmatched_period_has_no_cost(self):
+        """A consumption month with no matching billing entry keeps cost=None."""
+        client = _client()
+        periods = [
+            BillingPeriod(date(2026, 3, 1), date(2026, 3, 31), 31, 5.0, "GJ"),
+        ]
+        billing_costs = [
+            (date(2026, 1, 14), date(2026, 2, 11), 157.54),
+        ]
+        result = client._apply_gas_billing_costs(periods, billing_costs)
+        assert result[0].cost is None
+
+    def test_usage_preserved_after_cost_applied(self):
+        """Original usage and unit are unchanged after cost merge."""
+        client = _client()
+        periods = [
+            BillingPeriod(date(2026, 1, 1), date(2026, 1, 31), 31, 10.3, "GJ"),
+        ]
+        result = client._apply_gas_billing_costs(
+            periods, [(date(2026, 1, 14), date(2026, 2, 11), 157.54)]
+        )
+        assert result[0].usage == pytest.approx(10.3)
+        assert result[0].usage_unit == "GJ"
 
 
 # ---------------------------------------------------------------------------

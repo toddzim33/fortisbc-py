@@ -39,3 +39,13 @@ def account_summary_soup(account_summary_html):
 @pytest.fixture
 def consumption_page_soup(consumption_page_html):
     return BeautifulSoup(consumption_page_html, "html.parser")
+
+
+@pytest.fixture
+def gas_billing_history_html():
+    return load_fixture("gas_billing_history.html")
+
+
+@pytest.fixture
+def gas_billing_history_soup(gas_billing_history_html):
+    return BeautifulSoup(gas_billing_history_html, "html.parser")

@@ -40,6 +40,7 @@ ACCOUNT_SUMMARY_URL = f"{BASE_URL}/pages/account/account_summary.xhtml"
 ACCOUNT_DETAILS_URL = f"{BASE_URL}/pages/account/account_details.xhtml"
 CONSUMPTION_URL = f"{BASE_URL}/pages/account/consumtionHis.xhtml"
 CONSUMPTION_AJAX_URL = f"{CONSUMPTION_URL}?javax.portlet.faces.DirectLink=true"
+BILLING_HISTORY_URL = f"{BASE_URL}/pages/billing/billpymthistory.xhtml"
 
 
 class FortisbcClient:
@@ -240,19 +241,38 @@ class FortisbcClient:
     # ------------------------------------------------------------------
 
     def _fetch_gas_account(self, link_id: str, summary_view_state: str) -> Optional[GasAccount]:
-        """Full navigation flow for a gas account."""
+        """Full navigation flow for a gas account.
+
+        Route: account_details → billing history (costs + exact dates) →
+               consumption history (monthly GJ usage) → AJAX.
+        """
         try:
             details_html = self._select_account(link_id, summary_view_state)
             details_soup = BeautifulSoup(details_html, "html.parser")
             details_vs = self._extract_view_state(details_soup)
             meta = self._extract_account_details_meta(details_soup)
 
-            self._navigate_to_consumption(details_vs, is_electric=False)
+            # Detour through billing history to capture exact billing dates and costs.
+            billing_costs: list[tuple[date, date, float]] = []
+            try:
+                billing_html = self._navigate_to_billing_history(details_vs)
+                billing_soup = BeautifulSoup(billing_html, "html.parser")
+                billing_costs = self._parse_billing_history(billing_soup)
+                billing_vs = self._extract_view_state(billing_soup)
+                # Navigate from billing history back to consumption history.
+                self._navigate_from_billing_to_consumption(billing_vs)
+            except Exception:
+                _LOGGER.warning(
+                    "Could not fetch gas billing history — cost data will be unavailable; "
+                    "navigating directly to consumption"
+                )
+                self._navigate_to_consumption(details_vs, is_electric=False)
+
             consumption_html = self._get_consumption_page()
             consumption_soup = BeautifulSoup(consumption_html, "html.parser")
             consumption_vs = self._extract_view_state(consumption_soup)
 
-            return self._parse_gas_account(consumption_soup, consumption_vs, meta)
+            return self._parse_gas_account(consumption_soup, consumption_vs, meta, billing_costs)
         except Exception:
             _LOGGER.exception("Failed to fetch gas account")
             return None
@@ -291,9 +311,17 @@ class FortisbcClient:
     # ------------------------------------------------------------------
 
     def _parse_gas_account(
-        self, soup: BeautifulSoup, view_state: str, meta: dict
+        self,
+        soup: BeautifulSoup,
+        view_state: str,
+        meta: dict,
+        billing_costs: "list[tuple[date, date, float]] | None" = None,
     ) -> Optional[GasAccount]:
-        """Trigger gas AJAX and parse the monthly billing table."""
+        """Trigger gas AJAX and parse the monthly billing table.
+
+        If billing_costs is provided, costs are matched to consumption periods
+        by the billing period's start-date month (see _apply_gas_billing_costs).
+        """
         suffix = self._detect_consumption_suffix(soup)
         if not suffix:
             _LOGGER.warning("No consumption table found on gas page")
@@ -311,6 +339,8 @@ class FortisbcClient:
             periods = self._parse_monthly_table(soup, unit="GJ")
         if not periods:
             return None
+        if billing_costs:
+            periods = self._apply_gas_billing_costs(periods, billing_costs)
         return GasAccount(
             sa_id=meta.get("sa_id", ""),
             account_id=meta.get("account_id", ""),
@@ -571,6 +601,120 @@ class FortisbcClient:
         if resp.status_code == 200 and resp.text:
             return resp.text
         return None
+
+    def _navigate_to_billing_history(self, view_state: str) -> str:
+        """POST the account_details navigation form to reach billing history."""
+        resp = self._session.post(
+            ACCOUNT_DETAILS_URL,
+            data={
+                "navigation": "navigation",
+                "javax.faces.ViewState": view_state,
+                "navigation:paymentHistory": "navigation:paymentHistory",
+            },
+            allow_redirects=True,
+        )
+        return resp.text
+
+    def _navigate_from_billing_to_consumption(self, view_state: str) -> None:
+        """POST the billing history navigation form to reach consumption history."""
+        self._session.post(
+            BILLING_HISTORY_URL,
+            data={
+                "navigation": "navigation",
+                "javax.faces.ViewState": view_state,
+                "navigation:consumptionHistory": "navigation:consumptionHistory",
+            },
+            allow_redirects=True,
+        )
+
+    def _parse_billing_history(self, soup: BeautifulSoup) -> list[tuple[date, date, float]]:
+        """Parse Bill rows from the billing history table.
+
+        Returns a list of (start_date, end_date, amount) tuples, most-recent first.
+        Only rows with type "Bill" are included; Payments, Late charges, etc. are skipped.
+
+        Date cell format: "Mon DD - Mon DD, YYYY"
+          - The year applies to the end date.
+          - If start month number > end month number, start year = year − 1
+            (billing period straddles a year boundary, e.g. Dec 12 – Jan 13, 2026).
+        """
+        results = []
+        table = soup.find("table", class_=re.compile(r"table-hover"))
+        if not table:
+            _LOGGER.warning("No billing history table found on billpymthistory page")
+            return results
+
+        date_pattern = re.compile(
+            r"(\w{3})\s+(\d{1,2})\s*-\s*(\w{3})\s+(\d{1,2}),\s*(\d{4})"
+        )
+
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 3:
+                continue
+            if cells[1].get_text(strip=True) != "Bill":
+                continue
+
+            date_text = cells[0].get_text(separator=" ", strip=True)
+            m = date_pattern.search(date_text)
+            if not m:
+                continue
+
+            start_mon_str, start_day_str, end_mon_str, end_day_str, year_str = m.groups()
+            try:
+                year = int(year_str)
+                end_month = datetime.strptime(end_mon_str, "%b").month
+                start_month = datetime.strptime(start_mon_str, "%b").month
+                end_date = date(year, end_month, int(end_day_str))
+                start_year = year - 1 if start_month > end_month else year
+                start_date = date(start_year, start_month, int(start_day_str))
+            except ValueError:
+                _LOGGER.debug("Could not parse billing history date: %s", date_text)
+                continue
+
+            amount_text = cells[2].get_text(strip=True).replace("$", "").replace(",", "")
+            try:
+                amount = float(amount_text)
+            except ValueError:
+                continue
+
+            results.append((start_date, end_date, amount))
+
+        return results
+
+    def _apply_gas_billing_costs(
+        self,
+        periods: list[BillingPeriod],
+        billing_costs: list[tuple[date, date, float]],
+    ) -> list[BillingPeriod]:
+        """Attach billing costs to gas consumption periods.
+
+        Gas consumption periods are month-approximate (first/last of month).
+        Billing periods have exact dates and span calendar months — e.g. the
+        "January 2026" bill runs Jan 14 – Feb 11. The match key is
+        (year, month) of the billing period's start_date, which aligns with
+        the consumption month reported by the portal.
+        """
+        cost_by_month: dict[tuple[int, int], float] = {}
+        for start, _end, amount in billing_costs:
+            cost_by_month[(start.year, start.month)] = amount
+
+        result = []
+        for period in periods:
+            key = (period.start_date.year, period.start_date.month)
+            cost = cost_by_month.get(key)
+            if cost is not None:
+                result.append(BillingPeriod(
+                    start_date=period.start_date,
+                    end_date=period.end_date,
+                    days=period.days,
+                    usage=period.usage,
+                    usage_unit=period.usage_unit,
+                    cost=cost,
+                ))
+            else:
+                result.append(period)
+        return result
 
     def _parse_monthly_table(self, soup: BeautifulSoup, unit: str) -> list[BillingPeriod]:
         """Parse monthly usage table: 'Mon YYYY' + usage value.
