@@ -10,7 +10,7 @@ def test_billing_period():
         days=29,
         usage=1127.0,
         usage_unit="kWh",
-        amount_due=209.49,
+        cost=209.49,
     )
     assert p.usage == 1127.0
     assert p.usage_unit == "kWh"
