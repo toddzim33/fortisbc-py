@@ -117,6 +117,13 @@ class FortisbcClient:
 
         if gas_link:
             result["gas"] = self._fetch_gas_account(gas_link, view_state)
+            # Re-fetch the summary page to get a fresh ViewState before electric accounts.
+            # JSF server-side state advances after any account selection POST, so reusing
+            # the original ViewState for the next account risks a "View Expired" error.
+            if electric_links:
+                summary_html = self._get_account_summary()
+                soup = BeautifulSoup(summary_html, "html.parser")
+                view_state = self._extract_view_state(soup)
 
         for link_id in electric_links:
             result["electric"].extend(self._fetch_electric_account(link_id, view_state))
@@ -128,29 +135,44 @@ class FortisbcClient:
     # ------------------------------------------------------------------
 
     def _complete_saml_if_needed(self, resp) -> "requests.Response":
-        """If the response is a SAML assertion page, POST it to complete the handshake.
+        """Complete any pending SAML handshake hops after an initial GET.
 
-        The SAML intermediate page is a 200 OK with a JS auto-submit form containing
-        SAMLResponse + RelayState. Browsers execute the JS; we must POST manually.
+        Enterprise SSO sometimes chains multiple intermediate redirects, each
+        with a JS auto-submit form carrying SAMLResponse + RelayState.
+        Browsers handle these silently; we POST each hop manually.
+        Capped at 3 iterations to prevent infinite loops if SSO is broken.
+
+        After all hops, verifies we have actually landed inside the
+        hcl-axon portal — raises FortisbcError if the session is
+        still stuck on a CIAM or error page.
         """
-        from urllib.parse import urljoin
-        soup = BeautifulSoup(resp.text, "html.parser")
-        saml_input = soup.find("input", {"name": "SAMLResponse"})
-        if not saml_input:
-            return resp
-        form = soup.find("form")
-        action = form.get("action") if form else None
-        if not action:
-            _LOGGER.warning("SAML page found but no form action; cannot complete handshake")
-            return resp
-        action = urljoin(resp.url, action)
-        form_data = {
-            inp["name"]: inp.get("value", "")
-            for inp in soup.find_all("input")
-            if inp.get("name")
-        }
-        _LOGGER.debug("Completing SAML handshake → %s", action)
-        return self._session.post(action, data=form_data, allow_redirects=True)
+        from urllib.parse import urljoin, urlparse
+        for _ in range(3):
+            soup = BeautifulSoup(resp.text, "html.parser")
+            saml_input = soup.find("input", {"name": "SAMLResponse"})
+            if not saml_input:
+                break
+            form = soup.find("form")
+            action = form.get("action") if form else None
+            if not action:
+                _LOGGER.warning("SAML page found but no form action; cannot complete handshake")
+                break
+            action = urljoin(resp.url, action)
+            form_data = {
+                inp["name"]: inp.get("value", "")
+                for inp in form.find_all("input")
+                if inp.get("name")
+            }
+            _LOGGER.debug("Completing SAML hop → %s", action)
+            resp = self._session.post(action, data=form_data, allow_redirects=True)
+
+        # Verify we have landed inside the portal after all SAML hops
+        final_host = urlparse(resp.url).hostname or ""
+        if "accounts.fortisbc.com" not in final_host:
+            raise FortisbcError(
+                f"SAML handshake did not reach the portal — landed on: {resp.url}"
+            )
+        return resp
 
     # ------------------------------------------------------------------
     # Internal: navigation
@@ -160,11 +182,11 @@ class FortisbcClient:
         resp = self._session.get(ACCOUNT_SUMMARY_URL, allow_redirects=True)
         resp = self._complete_saml_if_needed(resp)
         html = resp.text
-        # Dismiss "Link accounts now" registration dialog if present
+        # Dismiss "Link accounts now" registration dialogue if present
         soup = BeautifulSoup(html, "html.parser")
         if soup.find("input", {"name": "regnLink1Form"}):
             vs = self._extract_view_state(soup)
-            _LOGGER.debug("Dismissing account-linking dialog")
+            _LOGGER.debug("Dismissing account-linking dialogue")
             resp = self._session.post(
                 ACCOUNT_SUMMARY_URL,
                 data={
@@ -223,13 +245,14 @@ class FortisbcClient:
             details_html = self._select_account(link_id, summary_view_state)
             details_soup = BeautifulSoup(details_html, "html.parser")
             details_vs = self._extract_view_state(details_soup)
+            meta = self._extract_account_details_meta(details_soup)
 
             self._navigate_to_consumption(details_vs, is_electric=False)
             consumption_html = self._get_consumption_page()
             consumption_soup = BeautifulSoup(consumption_html, "html.parser")
             consumption_vs = self._extract_view_state(consumption_soup)
 
-            return self._parse_gas_account(consumption_soup, consumption_vs)
+            return self._parse_gas_account(consumption_soup, consumption_vs, meta)
         except Exception:
             _LOGGER.exception("Failed to fetch gas account")
             return None
@@ -267,7 +290,9 @@ class FortisbcClient:
     # Internal: parsing
     # ------------------------------------------------------------------
 
-    def _parse_gas_account(self, soup: BeautifulSoup, view_state: str) -> Optional[GasAccount]:
+    def _parse_gas_account(
+        self, soup: BeautifulSoup, view_state: str, meta: dict
+    ) -> Optional[GasAccount]:
         """Trigger gas AJAX and parse the monthly billing table."""
         suffix = self._detect_consumption_suffix(soup)
         if not suffix:
@@ -286,12 +311,11 @@ class FortisbcClient:
             periods = self._parse_monthly_table(soup, unit="GJ")
         if not periods:
             return None
-        # FIXME: sa_id/account_id/customer_id/premise_address need live gas account debug
         return GasAccount(
-            sa_id="",
-            account_id="",
-            customer_id="",
-            premise_address="",
+            sa_id=meta.get("sa_id", ""),
+            account_id=meta.get("account_id", ""),
+            customer_id=meta.get("customer_id", ""),
+            premise_address=meta.get("premise_address", ""),
             billing_periods=periods,
         )
 
@@ -417,7 +441,11 @@ class FortisbcClient:
             f"param4{suffix}": hidden.get("param4", "undefined"),
             trigger_id: trigger_id,
         }
-        resp = self._session.post(CONSUMPTION_AJAX_URL, data=data)
+        resp = self._session.post(
+            CONSUMPTION_AJAX_URL,
+            data=data,
+            headers={"Referer": CONSUMPTION_URL},
+        )
         if resp.status_code == 200 and resp.text:
             return resp.text
         return None
@@ -425,6 +453,44 @@ class FortisbcClient:
     # ------------------------------------------------------------------
     # Internal: HTML helpers
     # ------------------------------------------------------------------
+
+    def _extract_account_details_meta(self, soup: BeautifulSoup) -> dict:
+        """Extract SA ID and premise address from the account_details page.
+
+        JSF portals typically embed these in read-only inputs or labelled table cells.
+        Best-effort — returns empty strings if fields are not found so callers
+        can proceed without failing hard.
+
+        Note: field names confirmed for electric; gas field names need live
+        verification against account_details.xhtml for a gas account.
+        """
+        meta = {"sa_id": "", "account_id": "", "customer_id": "", "premise_address": ""}
+
+        # Common patterns: hidden inputs or display spans with predictable IDs
+        for candidate in ["graph1:saId", "graph1:serviceAgreementId", "saId"]:
+            el = soup.find(attrs={"id": candidate}) or soup.find(attrs={"name": candidate})
+            if el:
+                meta["sa_id"] = el.get("value") or el.get_text(strip=True)
+                break
+
+        for candidate in ["graph1:accountId", "accountId"]:
+            el = soup.find(attrs={"id": candidate}) or soup.find(attrs={"name": candidate})
+            if el:
+                meta["account_id"] = el.get("value") or el.get_text(strip=True)
+                break
+
+        for candidate in ["graph1:premiseAddr", "graph1:address", "premiseAddress"]:
+            el = soup.find(attrs={"id": candidate}) or soup.find(attrs={"name": candidate})
+            if el:
+                meta["premise_address"] = el.get("value") or el.get_text(strip=True)
+                break
+
+        if not meta["sa_id"]:
+            _LOGGER.debug(
+                "SA ID not found on account_details page — "
+                "gas sensor will have empty sa_id until field names are confirmed"
+            )
+        return meta
 
     def _extract_view_state(self, soup: BeautifulSoup) -> str:
         field = soup.find("input", {"name": "javax.faces.ViewState"})
@@ -497,7 +563,11 @@ class FortisbcClient:
             f"param3{suffix}": "ABC",
             trigger_id: trigger_id,
         }
-        resp = self._session.post(CONSUMPTION_AJAX_URL, data=data)
+        resp = self._session.post(
+            CONSUMPTION_AJAX_URL,
+            data=data,
+            headers={"Referer": CONSUMPTION_URL},
+        )
         if resp.status_code == 200 and resp.text:
             return resp.text
         return None
