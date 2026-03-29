@@ -10,10 +10,14 @@ Auth flow (confirmed from HAR 2026-03-16):
 Data flow (per account):
   4. GET  account_summary.xhtml     → extract ViewState + account link IDs
   5. POST account_summary.xhtml     → select account (gas or electric)
-  6. GET  account_details.xhtml     → extract ViewState
-  7. POST account_details.xhtml     → navigate to consumption history
-  8. GET  consumtionHis.xhtml       → extract ViewState + hidden params + AJAX trigger IDs
-  9. POST consumtionHis.xhtml?javax.portlet.faces.DirectLink=true → AJAX: billing period data
+  6. GET  account_details.xhtml     → extract ViewState + per-SA graph AJAX params
+  7. POST account_details.xhtml?DirectLink (per SA) → AJAX: billing period data
+
+  Electric data comes from the per-SA graph AJAX on account_details (not consumption history).
+  The consumption history combined CDATA endpoint has two known issues: it omits recent billing
+  periods for accounts with monthly cycles and returns combined rather than per-SA usage totals.
+
+  Gas still routes through billing history → consumption history → AJAX for exact dates + costs.
 
 Note: "consumtion" is FortisBC's own typo in the URL — preserved faithfully.
 """
@@ -38,6 +42,7 @@ SMAGENTNAME = "agent_accessgateway_sovmprdcamagp01"  # static; JS-rendered on ww
 
 ACCOUNT_SUMMARY_URL = f"{BASE_URL}/pages/account/account_summary.xhtml"
 ACCOUNT_DETAILS_URL = f"{BASE_URL}/pages/account/account_details.xhtml"
+ACCOUNT_DETAILS_AJAX_URL = f"{ACCOUNT_DETAILS_URL}?javax.portlet.faces.DirectLink=true"
 CONSUMPTION_URL = f"{BASE_URL}/pages/account/consumtionHis.xhtml"
 CONSUMPTION_AJAX_URL = f"{CONSUMPTION_URL}?javax.portlet.faces.DirectLink=true"
 BILLING_HISTORY_URL = f"{BASE_URL}/pages/billing/billpymthistory.xhtml"
@@ -278,33 +283,107 @@ class FortisbcClient:
             return None
 
     def _fetch_electric_account(self, link_id: str, summary_view_state: str) -> list[ElectricAccount]:
-        """Full navigation flow for an electric account. Returns one ElectricAccount per SA."""
+        """Full navigation flow for an electric account. Returns one ElectricAccount per SA.
+
+        Uses per-SA AJAX calls on account_details.xhtml (the graph data endpoint) rather than
+        the combined consumption history CDATA endpoint. The combined endpoint has two problems:
+        it omits recent billing periods for accounts with monthly cycles and returns incorrect
+        combined usage totals instead of per-SA values.
+        """
         try:
             details_html = self._select_account(link_id, summary_view_state)
             details_soup = BeautifulSoup(details_html, "html.parser")
             details_vs = self._extract_view_state(details_soup)
 
-            self._navigate_to_consumption(details_vs, is_electric=True)
-            consumption_html = self._get_consumption_page()
-            consumption_soup = BeautifulSoup(consumption_html, "html.parser")
-            consumption_vs = self._extract_view_state(consumption_soup)
-
-            suffix = self._detect_consumption_suffix(consumption_soup)
-            if not suffix:
-                return []
-            hidden = self._extract_electric_hidden_params(consumption_soup, suffix)
-            trigger_id = self._find_ajax_trigger(consumption_soup, suffix)
-            if not trigger_id:
+            sa_params = self._parse_electric_graph_params(details_soup)
+            if not sa_params:
+                _LOGGER.warning("No per-SA graph scripts found on account_details for link %s", link_id)
                 return []
 
-            ajax_html = self._fetch_electric_ajax(consumption_soup, suffix, hidden, trigger_id, consumption_vs)
-            if not ajax_html:
-                return []
+            accounts = []
+            for params in sa_params:
+                ajax_html = self._fetch_electric_details_ajax(details_vs, **params)
+                if ajax_html:
+                    accounts.extend(self._parse_cdata_billing(ajax_html))
 
-            return self._parse_cdata_billing(ajax_html)
+            # Sort descending by SA ID so the account order is stable across fetches.
+            # The entity registry assigns unique_ids by index (fortisbc_electric_0_*, etc.),
+            # so consistent ordering is required to avoid data being served to the wrong entity.
+            accounts.sort(key=lambda a: a.sa_id, reverse=True)
+            return accounts
         except Exception:
             _LOGGER.exception("Failed to fetch electric account %s", link_id)
             return []
+
+    def _parse_electric_graph_params(self, soup: BeautifulSoup) -> list[dict]:
+        """Extract per-SA AJAX parameters from loadConsumpGraphsElctric[...] scripts.
+
+        Each SA on account_details has a script whose parameters object contains:
+            'd': '<saId>', 'e': '<custId>', 'f': '<accountId>',
+            'graph1:j_id<N>': 'graph1:j_id<N>'
+        The field order varies between accounts, so we extract each field independently.
+        Returns a list of dicts with keys: sa_id, cust_id, account_id, trigger_id.
+        """
+        results = []
+        for script in soup.find_all("script", id=re.compile(r"^graph1:j_id")):
+            content = script.string or ""
+            if "loadConsumpGraphsElctric" not in content:
+                continue
+            sa_id = _re_param(content, "d")
+            cust_id = _re_param(content, "e")
+            account_id = _re_param(content, "f")
+            m_trigger = re.search(r"'(graph1:j_id\w+)':'graph1:j_id\w+'", content)
+            trigger_id = m_trigger.group(1) if m_trigger else None
+            if sa_id and cust_id and account_id and trigger_id:
+                results.append({
+                    "sa_id": sa_id,
+                    "cust_id": cust_id,
+                    "account_id": account_id,
+                    "trigger_id": trigger_id,
+                })
+            else:
+                _LOGGER.debug(
+                    "Could not parse loadConsumpGraphsElctric script (sa=%s cust=%s acct=%s trigger=%s): %s",
+                    sa_id, cust_id, account_id, trigger_id, content[:200],
+                )
+        return results
+
+    def _fetch_electric_details_ajax(
+        self,
+        view_state: str,
+        sa_id: str,
+        cust_id: str,
+        account_id: str,
+        trigger_id: str,
+        num_periods: int = 6,
+    ) -> Optional[str]:
+        """POST the per-SA graph AJAX on account_details.xhtml.
+
+        Returns the last `num_periods` billing periods for a single SA.
+        The `g` parameter controls how many periods the server returns (default 3 on the portal;
+        we request 6 to get more history while staying within what the server will serve).
+        """
+        resp = self._session.post(
+            ACCOUNT_DETAILS_AJAX_URL,
+            data={
+                "AJAXREQUEST": "_viewRoot",
+                "graph1": "graph1",
+                "javax.faces.ViewState": view_state,
+                "a": "",
+                "b": "",
+                "c": "",
+                "d": sa_id,
+                "e": cust_id,
+                "f": account_id,
+                "g": str(num_periods),
+                "h": "false",
+                trigger_id: trigger_id,
+            },
+            headers={"Referer": ACCOUNT_DETAILS_URL},
+        )
+        if resp.status_code == 200 and resp.text:
+            return resp.text
+        return None
 
     # ------------------------------------------------------------------
     # Internal: parsing
@@ -761,3 +840,12 @@ def _parse_date(s: str) -> date:
     s = s.strip()
     day, month, year = s.split("/")
     return date(int(year), int(month), int(day))
+
+
+def _re_param(content: str, key: str) -> Optional[str]:
+    """Extract a single-quoted JS parameter value by key from a parameters object string.
+
+    Handles both literal ('key':'value') and defaulted ('key':var||'value') forms.
+    """
+    m = re.search(rf"'{re.escape(key)}':(?:\w+\|\|)?'([^']+)'", content)
+    return m.group(1) if m else None
