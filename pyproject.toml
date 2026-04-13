@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fortisbc"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python library for scraping FortisBC electricity and natural gas usage data"
 readme = "README.md"
 license = {file = "LICENSE"}

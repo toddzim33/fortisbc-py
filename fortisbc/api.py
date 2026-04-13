@@ -185,20 +185,32 @@ class FortisbcClient:
     # ------------------------------------------------------------------
 
     def _get_account_summary(self) -> str:
-        resp = self._session.get(ACCOUNT_SUMMARY_URL, allow_redirects=True)
+        # Navigate from the portal root, not account_summary.xhtml directly.
+        # Going straight to account_summary.xhtml causes login.xhtml to issue
+        # a SAML request with RelayState=timeout.jsp instead of the real target.
+        # The browser always hits accounts.fortisbc.com/ first, which triggers
+        # login.xhtml with the correct RelayState → account_summary.xhtml.
+        resp = self._session.get("https://accounts.fortisbc.com/", allow_redirects=True)
         resp = self._complete_saml_if_needed(resp)
+        # After SAML we may land on a page other than account_summary — navigate there directly.
+        if "account_summary" not in resp.url:
+            resp = self._session.get(ACCOUNT_SUMMARY_URL, allow_redirects=True)
+            resp = self._complete_saml_if_needed(resp)
         html = resp.text
         # Dismiss "Link accounts now" registration dialogue if present
         soup = BeautifulSoup(html, "html.parser")
         if soup.find("input", {"name": "regnLink1Form"}):
             vs = self._extract_view_state(soup)
             _LOGGER.debug("Dismissing account-linking dialogue")
+            # Find the "No, Thanks" dismiss button dynamically — JSF j_id numbers shift
+            dismiss_btn = soup.find("input", {"value": "No, Thanks"})
+            dismiss_name = dismiss_btn["name"] if dismiss_btn else "regnLink1Form:j_id134"
             resp = self._session.post(
                 ACCOUNT_SUMMARY_URL,
                 data={
                     "regnLink1Form": "regnLink1Form",
                     "javax.faces.ViewState": vs,
-                    "regnLink1Form:j_id133": "No, Thanks",
+                    dismiss_name: "No, Thanks",
                 },
                 allow_redirects=True,
             )
